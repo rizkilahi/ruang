@@ -2,8 +2,6 @@ import { execFile as execFileCallback } from 'node:child_process'
 import { promisify } from 'node:util'
 
 const execFile = promisify(execFileCallback)
-const CACHE_MS = 10_000
-const INSIGHTS_CACHE_MS = 60_000
 const COMMAND_TIMEOUT_MS = Number(process.env.RUANG_COMMAND_TIMEOUT_MS) > 0 ? Number(process.env.RUANG_COMMAND_TIMEOUT_MS) : 8_000
 const COMMAND_LOG_LIMIT = 100
 const LOG_TAIL_LINES = 200
@@ -18,10 +16,13 @@ export interface Source<T> {
   data: T
   error?: { code: 'COMMAND_FAILED' | 'TIMEOUT' | 'LOCKED'; message: string }
 }
+/** Where a snapshot was read from: the Hermes dashboard REST API, or the `hermes` CLI. */
+export type DataVia = 'dashboard' | 'cli'
 export interface RuntimeSnapshot {
   profiles: Source<Profile[]>
   openCode: Source<string>
   fetchedAt: string
+  via?: DataVia
 }
 export interface Task { title: string; status: string; id?: string; assignee?: string; priority?: number; board?: string; /** Belongs to a locked agent (profile lock): the title is withheld. */ private?: boolean }
 export interface KanbanBoard { slug: string; name: string; current: boolean; total: number }
@@ -58,8 +59,10 @@ export interface OfficeStation {
   freshness: string
 }
 export type ActivityKind = 'chat' | 'cron' | 'tools' | 'thinking'
-export interface AgentActivity { profile: string; availability: Availability; active: boolean; kind?: ActivityKind; label?: string; lastSeen?: string; mentionsOpenCode: boolean }
-export interface AgentActivitySnapshot { agents: AgentActivity[]; fetchedAt: string }
+/** `detail` is the redacted description Hermes recorded for the latest activity (dashboard source only). */
+export interface AgentActivity { profile: string; availability: Availability; active: boolean; kind?: ActivityKind; label?: string; detail?: string; lastSeen?: string; mentionsOpenCode: boolean }
+/** `window` is the look-back used to call an agent active (default `ACTIVITY_WINDOW`); `via` tells where it was read. */
+export interface AgentActivitySnapshot { agents: AgentActivity[]; fetchedAt: string; via?: DataVia; window?: string }
 export interface OfficeSnapshot { stations: OfficeStation[]; summary: OfficeSummary; fetchedAt: string }
 export interface OfficeSummary { declared: number; active: number; idle: number; offline: number; unknown: number; gatewaysReachable: number; gatewaysDeclared: number }
 export interface ExplicitOfficeState { station: OfficeStation['name']; state: 'Working' | 'Reviewing' | 'Collaborating'; expiresAt: string }
@@ -113,8 +116,8 @@ export interface LogLine { text: string; level: LogLevel }
 export interface LogFile { name: string; label: string; source: Source<LogLine[]> }
 export interface LogsSnapshot { files: LogFile[]; fetchedAt: string }
 
-type Run = (file: string, args: string[], options?: RunOptions) => Promise<string>
-interface RunOptions { /** stdout of a non-zero exit that is an expected empty state, not a failure. */ benign?: RegExp }
+export type Run = (file: string, args: string[], options?: RunOptions) => Promise<string>
+export interface RunOptions { /** stdout of a non-zero exit that is an expected empty state, not a failure. */ benign?: RegExp }
 
 /** Error thrown by the command runner. Carries stdout so a caller can recognise a benign non-zero exit. */
 export class CommandError extends Error {
@@ -124,11 +127,11 @@ export class CommandError extends Error {
 // ---------------------------------------------------------------------------
 // Shared text helpers
 
-function text(value: unknown): string | undefined {
+export function text(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }
 
-function stripAnsi(output: string): string {
+export function stripAnsi(output: string): string {
   return output.replace(new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, 'g'), '')
 }
 
@@ -191,7 +194,11 @@ export function jsonPayload(output: string): unknown {
 }
 
 export function parseTasks(output: string): Task[] {
-  const parsed = jsonPayload(output)
+  return tasksFromJson(jsonPayload(output))
+}
+
+/** Tasks from an already-decoded `kanban list --json` document (or a plain array of tasks). */
+export function tasksFromJson(parsed: unknown): Task[] {
   const list = Array.isArray(parsed) ? parsed : parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).tasks) ? (parsed as { tasks: unknown[] }).tasks : undefined
   if (!list) throw new Error('Kanban response was not an array.')
   const tasks = list.flatMap((item) => {
@@ -329,7 +336,7 @@ export function parseSkills(output: string): Skill[] {
   })
 }
 
-const PLATFORMS = ['WeCom Callback', 'Telegram', 'Discord', 'WhatsApp', 'Signal', 'Slack', 'Email', 'SMS', 'DingTalk', 'Feishu', 'WeCom', 'Weixin', 'BlueBubbles', 'QQBot', 'Yuanbao', 'Matrix', 'Mattermost', 'iMessage']
+export const PLATFORMS = ['WeCom Callback', 'Telegram', 'Discord', 'WhatsApp', 'Signal', 'Slack', 'Email', 'SMS', 'DingTalk', 'Feishu', 'WeCom', 'Weixin', 'BlueBubbles', 'QQBot', 'Yuanbao', 'Matrix', 'Mattermost', 'iMessage']
 const PLATFORM_ROW = new RegExp(`^\\s*(${PLATFORMS.join('|')})(?:\\s*:\\s*|\\s+)(?:[✓✗]\\s*)?(configured|connected)\\b`, 'i')
 
 export function parseChannelStatus(output: string): { channels: Channel[]; activeSessions?: number } {
@@ -434,7 +441,7 @@ export function parseLogLines(output: string): LogLine[] {
 
 const commandLog: CommandLogEntry[] = []
 
-function recordCommand(entry: CommandLogEntry): void {
+export function recordCommand(entry: CommandLogEntry): void {
   commandLog.unshift(entry)
   if (commandLog.length > COMMAND_LOG_LIMIT) commandLog.length = COMMAND_LOG_LIMIT
 }
@@ -450,7 +457,7 @@ function describeFailure(error: unknown): CommandError {
   return new CommandError('Read command was unavailable.', 'COMMAND_FAILED', stdout)
 }
 
-async function systemRun(file: string, args: string[], options: RunOptions = {}): Promise<string> {
+export async function systemRun(file: string, args: string[], options: RunOptions = {}): Promise<string> {
   const started = Date.now()
   const command = [file, ...args].join(' ')
   try {
@@ -469,7 +476,7 @@ async function systemRun(file: string, args: string[], options: RunOptions = {})
   }
 }
 
-function commandHealth(): CommandHealth {
+export function commandHealth(): CommandHealth {
   const failed = commandLog.filter((entry) => !entry.ok).length
   const averageMs = commandLog.length ? Math.round(commandLog.reduce((sum, entry) => sum + entry.durationMs, 0) / commandLog.length) : 0
   return { total: commandLog.length, failed, averageMs }
@@ -481,14 +488,14 @@ export function getCommandLog(): CommandLogSnapshot {
 
 export function clearCommandLog(): void { commandLog.length = 0 }
 
-function failure<T>(error: unknown, fallback: T): Source<T> {
+export function failure<T>(error: unknown, fallback: T): Source<T> {
   const described = error instanceof CommandError ? error : error instanceof Error && /timed out|timeout/i.test(error.message) ? new CommandError('Read timed out.', 'TIMEOUT') : undefined
   const code = described?.code ?? 'COMMAND_FAILED'
   const message = described?.message ?? (error instanceof SyntaxError ? 'Source returned output that could not be parsed.' : error instanceof Error && /^Unrecognized/.test(error.message) ? error.message : 'Read command was unavailable.')
   return { availability: 'unavailable', data: fallback, error: { code, message: code === 'TIMEOUT' ? 'Read timed out.' : message } }
 }
 
-async function read<T>(run: Run, file: string, args: string[], parse: (output: string) => T, fallback: T): Promise<Source<T>> {
+export async function read<T>(run: Run, file: string, args: string[], parse: (output: string) => T, fallback: T): Promise<Source<T>> {
   try {
     return { availability: 'available', data: parse(await run(file, args)) }
   } catch (error) {
@@ -514,7 +521,10 @@ export async function collectSnapshot(run: Run = systemRun): Promise<RuntimeSnap
 export const BOARD_SLUG = /^[a-z0-9][a-z0-9_-]{0,63}$/
 
 export function parseBoards(output: string): KanbanBoard[] {
-  const parsed = jsonPayload(output)
+  return boardsFromJson(jsonPayload(output))
+}
+
+export function boardsFromJson(parsed: unknown): KanbanBoard[] {
   if (!Array.isArray(parsed)) throw new Error('Unrecognized Kanban boards output.')
   return parsed.flatMap((item) => {
     if (!item || typeof item !== 'object') return []
@@ -610,6 +620,11 @@ export async function collectUsage(days: number, profiles: readonly string[], ru
     const result = await read<UsageInsights | null>(run, 'hermes', [...(names.length > 0 ? ['-p', agent] : []), 'insights', '--days', String(days)], (output) => parseInsights(output, days), null)
     return result.availability === 'available' && result.data ? { agent, availability: 'available', usage: result.data } : { agent, availability: 'unavailable', error: result.error?.message ?? 'hermes insights could not be read.' }
   })
+  return aggregateUsage(days, agents)
+}
+
+/** Sums the per-agent usage into one snapshot (shared by the CLI and the dashboard sources). */
+export function aggregateUsage(days: number, agents: AgentUsage[]): UsageSnapshot {
   const readable = agents.flatMap((agent) => (agent.usage ? [agent.usage] : []))
   const sum = (field: 'sessions' | 'messages' | 'toolCalls' | 'inputTokens' | 'outputTokens' | 'totalTokens') => readable.reduce((total, usage) => total + usage[field], 0)
   const costs = readable.flatMap((usage) => (usage.costUsd !== undefined && Number.isFinite(usage.costUsd) ? [usage.costUsd] : []))
@@ -702,7 +717,11 @@ function compact<T extends object>(value: T): T {
 }
 
 export function parseTaskDetail(output: string): TaskDetail {
-  const parsed = jsonPayload(output)
+  return taskDetailFromJson(jsonPayload(output))
+}
+
+/** Task detail from a decoded `kanban show --json` document (same shape: task, parents, children, comments, events, runs). */
+export function taskDetailFromJson(parsed: unknown): TaskDetail {
   const root = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {}
   const task = root.task && typeof root.task === 'object' ? root.task as Record<string, unknown> : undefined
   const id = text(task?.id)
@@ -754,7 +773,7 @@ export const ACTIVITY_WINDOW = '3m'
 const ACTIVITY_CONCURRENCY = 4
 const LOG_RECORD = /^(\d{4}-\d{2}-\d{2}[ T][\d:,.]+)\s+[A-Z]+(?:\s+\[[^\]]*\])?\s+([\w.]+):\s?(.*)$/
 const CHAT_MESSAGE = /\b(message|reply|replied|respond|inbound|outbound|received|sending|sent|chat)\b/i
-const ACTIVITY_LABELS: Record<ActivityKind, string> = {
+export const ACTIVITY_LABELS: Record<ActivityKind, string> = {
   chat: 'Replying to a chat',
   cron: 'Running a scheduled job',
   tools: 'Using tools',
@@ -794,7 +813,7 @@ export function parseRecentActivity(logOutput: string, sessionOutput?: string): 
 }
 
 /** Runs `task` over `items` with at most `limit` in flight, keeping the input order. */
-async function mapLimit<T, R>(items: readonly T[], limit: number, task: (item: T) => Promise<R>): Promise<R[]> {
+export async function mapLimit<T, R>(items: readonly T[], limit: number, task: (item: T) => Promise<R>): Promise<R[]> {
   const results: R[] = new Array(items.length)
   let next = 0
   const worker = async () => { while (next < items.length) { const index = next++; results[index] = await task(items[index]) } }
@@ -921,18 +940,19 @@ export function buildOfficeSnapshot(runtime: RuntimeSnapshot, board: TaskBoardSn
     // evidence of work wins; a Kanban task explains that work when it is running.
     const direct: OfficeState | undefined = overlay ?? (live.state !== 'Unknown' ? (taskWorkState !== 'Unknown' ? taskWorkState : live.state) : undefined)
     const state: OfficeState = direct ?? (taskWorkState !== 'Unknown' ? taskWorkState : collaboration !== 'Unknown' ? collaboration : freshRuntime && freshBoard && freshActivity && liveKnown ? 'Idle' : 'Unknown')
-    const currentTask = board.tasks.availability === 'unavailable' ? 'Not Available' : task?.title ?? 'No attributed task'
+    const liveDetail = live.probe?.active ? live.probe.detail : undefined
+    const currentTask = task?.title ?? liveDetail ?? (board.tasks.availability === 'unavailable' ? 'Not Available' : 'No attributed task')
     const activityLabel = state === 'Working' && taskWorkState === 'Working' && task ? `Kanban: ${task.title}`
       : state === 'Reviewing' && task ? `Reviewing: ${task.title}`
         : ['Working', 'Collaborating'].includes(state) && live.probe?.label ? live.probe.label
           : state === 'Idle' ? stopped ? 'On a break · gateway stopped' : 'On a break'
               : ''
     const recentActivity = live.probe
-      ? live.probe.active ? `${live.probe.label ?? 'Active'}${live.probe.lastSeen ? ` (last log ${live.probe.lastSeen})` : ''}` : `No activity in the last ${ACTIVITY_WINDOW}`
+      ? live.probe.active ? `${live.probe.detail ?? live.probe.label ?? 'Active'}${live.probe.lastSeen ? ` (last ${agentActivity?.via === 'dashboard' ? 'activity' : 'log'} ${live.probe.lastSeen})` : ''}` : `No activity in the last ${agentActivity?.window ?? ACTIVITY_WINDOW}`
       : activity.sessions.availability === 'unavailable' ? 'Not Available' : collaboration === 'Collaborating' ? 'Attributed active collaboration session' : 'No attributed recent activity'
-    const runtimeProvenance = agent.profile ? `Gateway ${gateway ?? 'Unknown'} (hermes profile list)` : 'OpenCode version availability is not a state signal'
+    const runtimeProvenance = agent.profile ? `Gateway ${gateway ?? 'Unknown'} (${runtime.via === 'dashboard' ? 'Hermes dashboard /api/profiles' : 'hermes profile list'})` : 'OpenCode version availability is not a state signal'
     const managedIdle = state === 'Idle' ? '; Ruang managed-idle placement policy (not agent-reported presence)' : ''
-    const liveProvenance = options.agentActivity ? `; live activity (${agent.profile ? `hermes -p ${agent.profile} logs/sessions` : 'agent logs mentioning OpenCode'}, last ${ACTIVITY_WINDOW}): ${!agentActivity || !live.known ? 'unavailable' : live.state !== 'Unknown' ? live.probe?.kind ?? 'active' : 'none'}` : ''
+    const liveProvenance = options.agentActivity ? `; live activity (${agent.profile ? (options.agentActivity.via === 'dashboard' ? `Hermes dashboard sessions of ${agent.profile}` : `hermes -p ${agent.profile} logs/sessions`) : 'agent logs mentioning OpenCode'}, last ${options.agentActivity.window ?? ACTIVITY_WINDOW}): ${!agentActivity || !live.known ? 'unavailable' : live.state !== 'Unknown' ? live.probe?.kind ?? 'active' : 'none'}` : ''
     return {
       id: agent.id,
       name: agent.id,
@@ -976,66 +996,3 @@ export function buildDashboard(parts: { runtime: RuntimeSnapshot; board: TaskBoa
   }
 }
 
-// ---------------------------------------------------------------------------
-// Cached accessors. Concurrent callers share one in-flight read per source.
-
-function cachedSource<T>(collect: () => Promise<T>, ttl = CACHE_MS) {
-  let entry: { value: T; expires: number } | undefined
-  let inflight: Promise<T> | undefined
-  const get = (now = Date.now()): Promise<T> => {
-    if (entry && entry.expires > now) return Promise.resolve(entry.value)
-    inflight ??= collect().then((value) => {
-      entry = { value, expires: Date.now() + ttl }
-      return value
-    }).finally(() => { inflight = undefined })
-    return inflight
-  }
-  return Object.assign(get, { clear: () => { entry = undefined } })
-}
-
-const runtimeSource = cachedSource(() => collectSnapshot())
-const taskBoardSource = cachedSource(() => collectTaskBoard())
-const calendarSource = cachedSource(() => collectCalendar())
-const activitySource = cachedSource(() => collectActivity())
-const knowledgeSource = cachedSource(() => collectKnowledge())
-const channelSource = cachedSource(() => collectChannels())
-const usageSources = new Map(USAGE_PERIODS.map((days) => [days, cachedSource(async () => collectUsage(days, (await getSnapshot()).profiles.data.map((profile) => profile.name)), INSIGHTS_CACHE_MS)]))
-
-/** Token usage of every agent over 1, 7 or 30 days (anything else reads as 7). */
-export function getUsage(days: number, now = Date.now()): Promise<UsageSnapshot> {
-  return (usageSources.get(days as typeof USAGE_PERIODS[number]) ?? usageSources.get(INSIGHT_DAYS)!)(now)
-}
-const logsSource = cachedSource(() => collectLogs(), 5_000)
-const agentActivitySource = cachedSource(async () => {
-  const runtime = await getSnapshot()
-  return collectAgentActivity(runtime.profiles.availability === 'available' ? runtime.profiles.data.map((profile) => profile.name) : [])
-}, 15_000)
-
-export function getSnapshot(now = Date.now()): Promise<RuntimeSnapshot> { return runtimeSource(now) }
-export function clearSnapshotCache(): void { runtimeSource.clear() }
-export function getTaskBoard(now = Date.now()): Promise<TaskBoardSnapshot> { return taskBoardSource(now) }
-export function getCalendar(now = Date.now()): Promise<CalendarSnapshot> { return calendarSource(now) }
-export function getActivity(now = Date.now()): Promise<ActivitySnapshot> { return activitySource(now) }
-export function getKnowledge(now = Date.now()): Promise<KnowledgeSnapshot> { return knowledgeSource(now) }
-export function getChannels(now = Date.now()): Promise<ChannelSnapshot> { return channelSource(now) }
-export function getLogs(now = Date.now()): Promise<LogsSnapshot> { return logsSource(now) }
-
-/** Detail for a task on the current board; returns undefined for ids Hermes did not list. */
-/** Details of a task on the current board snapshot; `board` picks the board it lives on. */
-export async function getTaskDetail(id: string, now = Date.now(), board?: string): Promise<TaskDetailSnapshot | undefined> {
-  if (!TASK_ID.test(id) || (board !== undefined && !BOARD_SLUG.test(board))) return undefined
-  const snapshot = await getTaskBoard(now)
-  if (snapshot.tasks.availability === 'available' && !snapshot.tasks.data.some((task) => task.id === id && task.board === board)) return undefined
-  return collectTaskDetail(id, systemRun, board)
-}
-
-export async function getOffice(now = Date.now()): Promise<OfficeSnapshot> {
-  const [runtime, board, activity, agentActivity] = await Promise.all([getSnapshot(now), getTaskBoard(now), getActivity(now), agentActivitySource(now)])
-  return buildOfficeSnapshot(runtime, board, activity, { agentActivity })
-}
-
-export async function getDashboard(now = Date.now()): Promise<DashboardSnapshot> {
-  const [runtime, board, calendar, activity, knowledge, channels, agentActivity] = await Promise.all([getSnapshot(now), getTaskBoard(now), getCalendar(now), getActivity(now), getKnowledge(now), getChannels(now), agentActivitySource(now)])
-  const office = buildOfficeSnapshot(runtime, board, activity, { agentActivity })
-  return buildDashboard({ runtime, board, calendar, activity, knowledge, channels, office, commands: commandHealth() })
-}

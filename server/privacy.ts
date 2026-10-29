@@ -1,5 +1,5 @@
 import type { MemorySnapshot } from './memory.js'
-import type { ActivitySnapshot, CalendarSnapshot, DashboardSnapshot, LogsSnapshot, OfficeSnapshot, TaskBoardSnapshot, UsageSnapshot } from './mission-control.js'
+import type { ActivitySnapshot, CalendarSnapshot, DashboardSnapshot, LogsSnapshot, OfficeSnapshot, Session, TaskBoardSnapshot, UsageSnapshot } from './mission-control.js'
 import { isHidden, type Privacy } from './profile-lock.js'
 
 // Withholds the private data of locked agents (see profile-lock.ts) from each snapshot, per
@@ -36,14 +36,18 @@ export function redactCalendar(calendar: CalendarSnapshot, privacy: Privacy): Ca
   return { ...calendar, jobs: { ...calendar.jobs, data: calendar.jobs.data.map((job) => isHidden(privacy, job.agent ?? DEFAULT_AGENT) ? { ...job, name: PRIVATE_JOB, private: true } : job) } }
 }
 
+// A session belongs to its `actor` (the Hermes profile, set by the dashboard source); the CLI
+// source lists the active profile's sessions only and leaves `actor` empty, so those are `default`.
+const redactSession = (session: Session, privacy: Privacy): Session => isHidden(privacy, session.actor ?? DEFAULT_AGENT) ? { ...session, title: PRIVATE_SESSION, preview: '', workspace: undefined } : session
+
 export function redactActivity(activity: ActivitySnapshot, privacy: Privacy): ActivitySnapshot {
-  if (!isHidden(privacy, DEFAULT_AGENT)) return activity
-  return { ...activity, sessions: { ...activity.sessions, data: activity.sessions.data.map((session) => ({ ...session, title: PRIVATE_SESSION, preview: '', workspace: undefined })) } }
+  if (quiet(privacy)) return activity
+  return { ...activity, sessions: { ...activity.sessions, data: activity.sessions.data.map((session) => redactSession(session, privacy)) } }
 }
 
 export function redactDashboard(dashboard: DashboardSnapshot, privacy: Privacy): DashboardSnapshot {
-  if (!isHidden(privacy, DEFAULT_AGENT) || !dashboard.activity.latest) return dashboard
-  return { ...dashboard, activity: { ...dashboard.activity, latest: { ...dashboard.activity.latest, title: PRIVATE_SESSION, preview: '', workspace: undefined } } }
+  if (quiet(privacy) || !dashboard.activity.latest) return dashboard
+  return { ...dashboard, activity: { ...dashboard.activity, latest: redactSession(dashboard.activity.latest, privacy) } }
 }
 
 export function redactLogs(logs: LogsSnapshot, privacy: Privacy): LogsSnapshot {
